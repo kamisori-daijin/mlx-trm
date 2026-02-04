@@ -1,150 +1,104 @@
 from contextlib import contextmanager
 from functools import partial
 
-import mlx.core as mx
-import mlx.nn as nn
-from mlx.optimizers import Optimizer, clip_grad_norm
-from mlx.utils import tree_map
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from datasets import load_dataset
+from transformers import GPT2Tokenizer
+import math
+import os
 from tqdm import tqdm
-
-
-def ema_update(ema_params, model, alpha=0.95):
-    return tree_map(
-        lambda a, b: a * alpha + (1 - alpha) * b, ema_params, model.parameters()
-    )
-
+import copy
+from ema.ema import EMA
 
 @contextmanager
-def use_ema(model, ema_params):
-    orig = model.parameters()
-    model.update(ema_params)
-    try:
-        yield
-    finally:
-        model.update(orig)
 
+def train(
+    model,
+    train_loader,
+    val_loader,
+    tokenizer,
+    device,
+    epochs=5,
+    lr=1e-4,
+    warmup_steps=1000,
+    n_supervision_steps=4,
+    ema_decay=0.999,
+    save_path='trm_tinystories.pt'
+):
+    """Training loop with deep supervision and EMA"""
 
-class Trainer:
-    def __init__(self, model: nn.Module, optimizer: Optimizer):
-        self.model = model
-        self.optimizer = optimizer
+    model = model.to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.1)
+    ema = EMA(model, decay=ema_decay)
 
-        self.ema_params = model.parameters()
+    # Learning rate scheduler with warmup
+    def lr_schedule(step):
+        if step < warmup_steps:
+            return step / warmup_steps
+        return 1.0
 
-        self.train_error_trace: list[float] = []
-        self.train_acc_trace: list[float] = []
-        self.val_error_trace: list[float] = []
-        self.val_acc_trace: list[float] = []
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule)
 
-    def eval_fn(self, carry, batch):
-        carry, outputs = self.model(carry, batch)
-        label = carry["current_data"]["label"]
-        pred = outputs["logits"]
-        is_correct = mx.argmax(pred, axis=1) == label
+    global_step = 0
+    best_val_loss = float('inf')
 
-        ce = nn.losses.cross_entropy(pred, label, reduction="mean")
-        bce = nn.losses.binary_cross_entropy(
-            outputs["q_halt_logits"], is_correct, with_logits=True, reduction="mean"
-        )
-        loss = ce + 0.5 * bce
+    for epoch in range(epochs):
+        model.train()
+        pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs}')
 
-        stats = {
-            "q_prob_mean": mx.sigmoid(outputs["q_halt_logits"]).mean(),
-            "frac_halted": carry["halted"].mean(),  # fraction halted
-            "avg_steps": carry["steps"].mean(),  # average step index
-        }
+        for input_ids, targets in pbar:
+            input_ids = input_ids.to(device)
+            targets = targets.to(device)
 
-        return loss, carry, mx.sum(is_correct), stats
+            optimizer.zero_grad()
+            loss = model(input_ids, targets, n_supervision_steps=n_supervision_steps)
+            loss.backward()
 
-    def train(self, train, val=None, epochs: int = 10):
-        state = [self.model.state, self.optimizer.state]
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-        @partial(mx.compile, inputs=state, outputs=state)
-        def step(carry, batch):
-            train_step_fn = nn.value_and_grad(self.model, self.eval_fn)
-            (loss, carry, correct, stats), grads = train_step_fn(carry, batch)
-            grads, _ = clip_grad_norm(grads, max_norm=1.0)
-            self.optimizer.update(self.model, grads)
-            return loss, carry, correct, stats
+            optimizer.step()
+            scheduler.step()
+            ema.update()
 
-        carry = None
+            global_step += 1
+            pbar.set_postfix({'loss': f'{loss.item():.4f}', 'lr': f'{scheduler.get_last_lr()[0]:.6f}'})
 
-        epoch_bar = tqdm(range(epochs), desc="Training", unit="epoch")
-        for _ in epoch_bar:
-            self.model.train()
-            train.reset()
-            total_loss, total_correct, n = 0, 0, 0
+        # Validation
+        ema.apply_shadow()
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for input_ids, targets in tqdm(val_loader, desc='Validation'):
+                input_ids = input_ids.to(device)
+                targets = targets.to(device)
+                loss = model(input_ids, targets, n_supervision_steps=n_supervision_steps)
+                val_loss += loss.item()
 
-            q_prob_accum = 0.0
-            frac_halted_accum = 0.0
-            avg_steps_accum = 0.0
-            n_batches = 0
+        val_loss /= len(val_loader)
+        print(f'Epoch {epoch+1} - Val Loss: {val_loss:.4f}')
 
-            for batch in train:
-                batch = {k: mx.array(v) for k, v in batch.items()}
-                if (carry is None) or (
-                    carry["halted"].shape[0] != batch["image"].shape[0]
-                ):  # reset for different batch sizes
-                    carry = self.model.initial_carry(batch)
+        # Generate sample
+        prompt = "Once upon a time"
+        prompt_ids = torch.tensor([tokenizer.encode(prompt)], device=device)
+        generated = model.generate(prompt_ids, max_new_tokens=100)
+        generated_text = tokenizer.decode(generated[0].tolist())
+        print(f'Generated: {generated_text[:300]}...\n')
 
-                loss, carry, correct, stats = step(carry, batch)
-                mx.eval(state)
+        # Save best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'ema_shadow': ema.shadow,
+                'epoch': epoch,
+                'val_loss': val_loss
+            }, save_path)
+            print(f'Saved best model with val_loss={val_loss:.4f}')
 
-                self.ema_params = ema_update(self.ema_params, self.model)
+        ema.restore()
 
-                total_loss += loss.item() * batch["image"].shape[0]
-                total_correct += int(correct)
-                n += batch["image"].shape[0]
-
-                q_prob_accum += float(stats["q_prob_mean"])
-                frac_halted_accum += float(stats["frac_halted"])
-                avg_steps_accum += float(stats["avg_steps"])
-                n_batches += 1
-
-            avg_train_loss = total_loss / n
-            avg_train_acc = total_correct / n
-
-            self.train_error_trace.append(avg_train_loss)
-            self.train_acc_trace.append(avg_train_acc)
-
-            postfix = {
-                "train_loss": f"{avg_train_loss:.3f}",
-                "train_acc": f"{avg_train_acc:.3f}",
-                "p_halt": f"{q_prob_accum / n_batches:.3f}",
-                "frac_halt": f"{frac_halted_accum / n_batches:.3f}",
-                "avg_steps": f"{avg_steps_accum / n_batches:.2f}",
-            }
-
-            if val is not None:
-                avg_val_loss, avg_val_acc = self.evaluate(val)
-                self.val_error_trace.append(avg_val_loss)
-                self.val_acc_trace.append(avg_val_acc)
-                postfix.update(
-                    {"val_loss": f"{avg_val_loss:.3f}", "val_acc": f"{avg_val_acc:.3f}"}
-                )
-
-            epoch_bar.set_postfix(postfix)
-
-    def evaluate(self, test):
-        self.model.eval()
-        test.reset()
-        total_loss, total_correct, n = 0, 0, 0
-
-        with use_ema(self.model, self.ema_params):
-            for batch in test:
-                batch = {k: mx.array(v) for k, v in batch.items()}
-                carry = self.model.initial_carry(batch)
-
-                while True:
-                    loss, carry, correct, stats = self.eval_fn(carry, batch)
-                    if carry["halted"].all():
-                        break
-
-                total_loss += loss.item() * batch["image"].shape[0]
-                total_correct += int(correct)
-                n += batch["image"].shape[0]
-
-        avg_loss = total_loss / n
-        avg_acc = total_correct / n
-
-        return avg_loss, avg_acc
+    return model

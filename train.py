@@ -1,77 +1,75 @@
-import argparse
+from torch.utils.data import Dataset, DataLoader
+import torch
+from datasets import load_dataset
+from trm_build import RMSNorm, TransformerBlock, apply_rotary_pos_emb, RotaryEmbedding
+from trm_model import TinyRecursiveModel
+from models.config import config
+from dataset.tinystories import TinyStoriesDataset 
+from training.instantiate import tokenizer, device, model
+from training.trainer import train
+from ema.ema import EMA
 
-import mlx.core as mx
-import mlx.optimizers as optim
 
-from data.vision import cifar10, mnist
-from models import trm
-from training.trainer import Trainer
 
-parser = argparse.ArgumentParser(add_help=True)
-parser.add_argument(
-    "--dataset",
-    type=str,
-    default="mnist",
-    choices=["mnist", "cifar10"],
-    help="dataset to use",
+train_dataset = TinyStoriesDataset(
+    tokenizer,
+    split='train',
+    max_length=config['max_seq_len'] + 1,  # +1 for next token prediction
+    max_samples=config['max_train_samples']
 )
-parser.add_argument("-b", "--batch_size", type=int, default=1024, help="batch size")
-parser.add_argument("-e", "--epochs", type=int, default=15, help="number of epochs")
-parser.add_argument("--lr", type=float, default=3e-4, help="learning rate")
-parser.add_argument("--seed", type=int, default=0, help="random seed")
-parser.add_argument("--cpu", action="store_true", help="use cpu only")
+val_dataset = TinyStoriesDataset(
+    tokenizer,
+    split='validation',
+    max_length=config['max_seq_len'] + 1,
+    max_samples=config['max_val_samples']
+)
+
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=config['batch_size'],
+    shuffle=True,
+    num_workers=2,
+    pin_memory=True
+)
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=config['batch_size'],
+    num_workers=2,
+    pin_memory=True
+)
+
+#Training
+model = train(
+    model=model,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    tokenizer=tokenizer,
+    device=device,
+    epochs=config['epochs'],
+    lr=config['lr'],
+    warmup_steps=config['warmup_steps'],
+    n_supervision_steps=config['n_supervision_steps'],
+)
+
+print('\nTraining complete!')
 
 
-def main(args):
-    if args.cpu:
-        mx.set_default_device(mx.cpu)
-    mx.random.seed(args.seed)
+# test Generation
+model.eval()
+ema = EMA(model)
 
-    if args.dataset == "mnist":
-        train_data, test_data, meta = mnist(args.batch_size)
-    elif args.dataset == "cifar10":
-        train_data, test_data, meta = cifar10(args.batch_size)
-    else:
-        raise NotImplementedError(f"{args.dataset=} is not implemented.")
-    n_inputs = next(train_data)["image"].shape[1:]
-    train_data.reset()
+prompts = [
+    "Once upon a time",
+    "The little girl",
+    "One day, a rabbit",
+    "Tom and his friend"
+]
 
-    config = trm.ModelConfig(
-        in_channels=n_inputs[-1],
-        depth=2,
-        dim=64,
-        heads=4,
-        patch_size=(4, 4),
-        n_outputs=10,
-    )
-    model = trm.Model(config)
-    model.summary()
-
-    n_steps = args.epochs * meta["steps_per_epoch"]
-    n_linear = n_steps * 0.10
-    linear = optim.linear_schedule(0, args.lr, steps=n_linear)
-    cosine = optim.cosine_decay(args.lr, n_steps - n_linear, 0)
-    lr_schedule = optim.join_schedules([linear, cosine], [n_linear])
-    optimizer = optim.AdamW(
-        learning_rate=lr_schedule, betas=(0.9, 0.999), weight_decay=0.01
-    )
-
-    manager = Trainer(model, optimizer)
-    manager.train(train_data, val=test_data, epochs=args.epochs)
-
-    #! plotting
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(5, 3))
-    lw = 2
-    ax.plot(mx.array(manager.train_acc_trace) * 100, label="train", color="r", lw=lw)
-    ax.plot(mx.array(manager.val_acc_trace) * 100, label="val", color="b", lw=lw)
-    ax.legend()
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Accuracy")
-    fig.tight_layout()
-    plt.show()
-
-
-if __name__ == "__main__":
-    main(parser.parse_args())
+print('\n=== Generated Stories ===\n')
+for prompt in prompts:
+    prompt_ids = torch.tensor([tokenizer.encode(prompt)], device=device)
+    generated = model.generate(prompt_ids, max_new_tokens=150, temperature=0.8)
+    text = tokenizer.decode(generated[0].tolist())
+    print(f'Prompt: "{prompt}"')
+    print(f'Story: {text}\n')
+    print('-' * 50 + '\n')
