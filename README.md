@@ -1,6 +1,6 @@
-# MLX Tiny Recursive Models (Currently using a torch)
+# pytorch Tiny Recursive Models 
 
-Simplified reimplementation of [TinyRecursiveModels](https://github.com/SamsungSAILMontreal/TinyRecursiveModels) using [MLX](https://github.com/ml-explore/mlx).
+Simplified reimplementation of [TinyRecursiveModels](https://github.com/SamsungSAILMontreal/TinyRecursiveModels)
 
 ## Usage
 
